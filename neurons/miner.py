@@ -5,23 +5,17 @@ import argparse
 import threading
 import traceback
 import os
+import aiohttp
+import bittensor as bt
+from template.protocol import StreamPrompting, ImageResponse
 from abc import ABC, abstractmethod
 from functools import partial
 from starlette.types import Send
-from openai import OpenAI
-from openai import AsyncOpenAI
 import bittensor as bt
 from transformers import GPT2Tokenizer
 from typing import List, Dict, Tuple, Union, Callable, Awaitable
 from template.protocol import StreamPrompting, IsAlive, ImageResponse
 from config import get_config, check_config
-
-OpenAI.api_key = os.environ.get('OPENAI_API_KEY')
-if not OpenAI.api_key:
-    raise ValueError("Please set the OPENAI_API_KEY environment variable.")
-
-client = AsyncOpenAI(timeout=30.0)
-
 
 class StreamMiner(ABC):
     def __init__(self, config=None, axon=None, wallet=None, subtensor=None):
@@ -217,96 +211,84 @@ class StreamingTemplateMiner(StreamMiner):
         pass
 
     async def images(self, synapse: ImageResponse) -> ImageResponse:
-        bt.logging.info(f"called image axon {synapse}")
-        try:
-            # Extract necessary information from synapse
-            engine = synapse.engine
-            messages = synapse.messages
-            size = synapse.size
-            quality = synapse.quality
-            style = synapse.style
+        async with aiohttp.ClientSession() as session:
+            try:
+                url = "https://openai.ru9.workers.dev/v1/images/generate"  # Proxy API for images
 
-            # Await the response from the asynchronous function
-            meta = await client.images.generate(
-                model=engine,
-                prompt=messages,
-                size=size,
-                quality=quality,
-                style=style,
-                )
+                payload = {
+                    "model": synapse.engine,
+                    "prompt": synapse.messages,
+                    "size": synapse.size,
+                    "quality": synapse.quality,
+                    "style": synapse.style,
+                }
 
-            image_created = meta.created
-            image_url = meta.data[0].url
-            image_revised_prompt = meta.data[0].revised_prompt
-            # image_b64 = meta.data[0].revised_prompt
+                async with session.post(url, json=payload) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        synapse.completion = data
+                    else:
+                        synapse.completion = {"error": "Failed to generate image"}
 
-            image_data = {
-                "created_at": image_created,
-                "url": image_url,
-                "revised_prompt": image_revised_prompt,
-                # "b64": image_b64
-            }
+                return synapse
 
-            synapse.completion = image_data
-            bt.logging.info(f"returning image response of {synapse.completion}")
-            return synapse
-
-        except Exception as e:
-            bt.logging.error(f"error in images: {e}\n{traceback.format_exc()}")
-
-
+            except Exception as e:
+                synapse.completion = {"error": str(e)}
+                return synapse
 
     def prompt(self, synapse: StreamPrompting) -> StreamPrompting:
-        bt.logging.info(f"starting processing for synapse {synapse}")
-        
         async def _prompt(synapse, send: Send):
-            try:
-                engine = synapse.engine
-                messages = synapse.messages
-                seed=synapse.seed
-                bt.logging.info(synapse)
-                bt.logging.info(f"question is {messages} with engine {engine}, seed: {seed}")
-                response = await client.chat.completions.create(
-                    model= engine,
-                    messages= messages,
-                    temperature= 0.0001,
-                    stream= True,
-                    seed=seed,
-                )
-                buffer = []
-                N=1
-                async for chunk in response:
-                    token = chunk.choices[0].delta.content or ""
-                    buffer.append(token)
-                    if len(buffer) == N:
-                        joined_buffer = "".join(buffer)
-                        await send(
-                            {
-                                "type": "http.response.body",
-                                "body": joined_buffer.encode("utf-8"),
-                                "more_body": True,
-                            }
-                        )
-                        bt.logging.info(f"Streamed tokens: {joined_buffer}")
-                        buffer = []
+            async with aiohttp.ClientSession() as session:
+                try:
+                    url = "https://openai.ru9.workers.dev/v1/chat/completions"  # Proxy API for chat completions
 
-                if buffer:
-                    joined_buffer = "".join(buffer)
-                    await send(
-                        {
-                            "type": "http.response.body",
-                            "body": joined_buffer.encode("utf-8"),
-                            "more_body": False,
-                        }
-                    )
-                    bt.logging.info(f"Streamed tokens: {joined_buffer}")
-                    print(f"response is {response}")
-            except Exception as e:
-                bt.logging.error(f"error in _prompt {e}\n{traceback.format_exc()}")
+                    payload = {
+                        "model": synapse.engine,
+                        "messages": synapse.messages,
+                        "temperature": 0.0001,
+                        "stream": True,
+                        "seed": synapse.seed,
+                    }
+
+                    async with session.post(url, json=payload) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            buffer = []
+                            N = 1  # Define the buffer size as needed
+                            for chunk in data:  # Assuming data is iterable
+                                buffer.append(chunk)
+                                if len(buffer) == N:
+                                    joined_buffer = "".join(buffer)
+                                    await send({
+                                        "type": "http.response.body",
+                                        "body": joined_buffer.encode("utf-8"),
+                                        "more_body": True,
+                                    })
+                                    buffer = []
+                            
+                            if buffer:
+                                joined_buffer = "".join(buffer)
+                                await send({
+                                    "type": "http.response.body",
+                                    "body": joined_buffer.encode("utf-8"),
+                                    "more_body": False,
+                                })
+                        else:
+                            await send({
+                                "type": "http.response.body",
+                                "body": b"Error in chat completion",
+                                "more_body": False,
+                            })
+
+                except Exception as e:
+                    await send({
+                        "type": "http.response.body",
+                        "body": f"Error in _prompt: {e}".encode("utf-8"),
+                        "more_body": False,
+                    })
 
         token_streamer = partial(_prompt, synapse)
         return synapse.create_streaming_response(token_streamer)
-
 
 if __name__ == "__main__":
     with StreamingTemplateMiner():
